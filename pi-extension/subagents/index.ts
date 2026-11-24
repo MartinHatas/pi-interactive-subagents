@@ -15,6 +15,7 @@ import {
   appendFileSync,
   realpathSync,
 } from "node:fs";
+import { deliverReports } from "./reports.ts";
 import { homedir } from "node:os";
 import {
   isMuxAvailable,
@@ -26,6 +27,10 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
+  focusSurface,
+  markChildPane,
+  paneBadge,
+  readChildPanes,
 } from "./tmux.ts";
 
 import {
@@ -642,7 +647,7 @@ interface RunningSubagent {
   interactive: boolean;
   /**
    * Non-auto-exit pi child (e.g. the `repo` agent). Reports each
-   * orchestrator-initiated turn via `.report` and keeps its pane open — even
+   * orchestrator-initiated turn via `.reports/` and keeps its pane open — even
    * across orchestrator exit/reload. Only the human closes it.
    */
   persistent?: boolean;
@@ -754,7 +759,9 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
-    const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
+    const badge = paneBadge(agent.surface);
+    const identity = badge ? `${badge.ansi}${badge.label} ${agent.name}${RST}` : agent.name;
+    const left = ` ${icon} ${elapsed}  ${identity}${agentTag} `;
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"
@@ -969,6 +976,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
  * the subagent registers (or its launch fails).
  */
 const reservedNames = new Set<string>();
+const launchingDirectories = new Set<string>();
 
 /**
  * Return `base`, or `base-2`, `base-3`, … so the result is unique within this
@@ -1557,35 +1565,30 @@ function deliverPendingQuestion(running: RunningSubagent): void {
 }
 
 /**
- * Deliver a persistent child's per-turn report (`${sessionFile}.report`,
+ * Deliver a persistent child's per-turn reports (`${sessionFile}.reports/`,
  * written by subagent-done.ts) to the orchestrator. The child keeps running.
  */
 function deliverPendingReport(running: RunningSubagent): void {
-  const reportFile = `${running.sessionFile}.report`;
-  let payload: any = null;
-  try {
-    if (!existsSync(reportFile)) return;
-    payload = JSON.parse(readFileSync(reportFile, "utf-8"));
-  } catch {}
-  try {
-    unlinkSync(reportFile);
-  } catch {}
-  if (typeof payload?.report !== "string") return;
-
-  const name = running.name;
-  const where = payload.cwd ?? running.cwd ?? "";
-  const abortedNote = payload.aborted ? " (turn aborted by the user in the pane)" : "";
-  latestPi?.sendMessage(
-    {
+  if (!latestPi) return;
+  deliverReports(running.sessionFile, (payload) => {
+    const { name, agent, cwd } = running;
+    const aborted = payload.aborted;
+    latestPi!.sendMessage({
       customType: "subagent_report",
-      content:
-        `Sub-agent "${name}"${where ? ` [${where}]` : ""} reports${abortedNote}:\n\n${payload.report}` +
-        `\n\nIts pane stays open for the user. Send the next work order with subagent_message({ name: "${name}", message: "…" }).`,
+      content: `Sub-agent "${name}"${cwd ? ` [${cwd}]` : ""} reports${aborted ? " (aborted)" : ""}:\n\n${payload.report}`,
       display: true,
-      details: { name, agent: running.agent, cwd: where, aborted: !!payload.aborted },
-    },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+      details: { name, agent, cwd, aborted },
+    }, { triggerTurn: true, deliverAs: "steer" });
+  });
+}
+
+function labelChild(running: RunningSubagent, owner: string): void {
+  const { id, name, agent, startTime, cwd, sessionFile, activityFile, persistent } = running;
+  try {
+    markChildPane(running.surface, persistent ? JSON.stringify({ owner, id, name, agent, startTime, cwd, sessionFile, activityFile }) : "", name);
+  } catch {
+    latestCtx?.ui.notify(`Could not label or persist pane ${running.surface}`, "warning");
+  }
 }
 
 async function watchSubagent(
@@ -1594,8 +1597,9 @@ async function watchSubagent(
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
+  const watchSignal = AbortSignal.any([signal, getModuleAbortSignal()]);
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await pollForExit(surface, watchSignal, {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1644,6 +1648,9 @@ async function watchSubagent(
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
+    if (watchSignal.aborted) throw new Error("Watcher detached");
+    deliverPendingReport(running);
+
     // Pi subagent result extraction
     let summary: string;
     if (existsSync(sessionFile)) {
@@ -1666,7 +1673,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    if (result.errorMessage !== "tmux pane closed") closeSurface(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1683,14 +1690,14 @@ async function watchSubagent(
   } catch (err: any) {
     // Orchestrator exit/reload aborts the watcher. Persistent panes belong to
     // the human from then on — leave them open.
-    if (!(running.persistent && (signal.aborted || getModuleAbortSignal().aborted))) {
+    if (!running.persistent) {
       try {
         closeSurface(surface);
       } catch {}
     }
     runningSubagents.delete(running.id);
 
-    if (signal.aborted) {
+    if (watchSignal.aborted) {
       return {
         name,
         task,
@@ -1744,6 +1751,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+    }
+    const owner = ctx.sessionManager.getSessionId?.();
+    if (!owner) return;
+    try {
+      for (const { surface, metadata } of readChildPanes()) {
+        const state = JSON.parse(metadata);
+        if (state.owner !== owner || runningSubagents.has(state.id)) continue;
+        const running: RunningSubagent = {
+          ...state, task: "", surface, persistent: true, interactive: true,
+          statusState: createStatusState({ source: "pi", startTimeMs: state.startTime }),
+          abortController: new AbortController(),
+        };
+        runningSubagents.set(running.id, running);
+        void watchSubagent(running, running.abortController!.signal).then((result) => {
+          if (result.error === "cancelled") return;
+          updateWidget();
+          pi.sendMessage({ customType: "subagent_result", content: resolveResultPresentation(result, running.name), display: true }, { triggerTurn: true, deliverAs: "steer" });
+        });
+      }
+      if (runningSubagents.size) {
+        startWidgetRefresh();
+        startStatusRefresh(pi);
+      }
+    } catch {
+      ctx.ui.notify("Could not reconnect to all tmux child panes", "warning");
     }
   });
 
@@ -1860,8 +1892,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Persistent agents own their directory: a second spawn for the same cwd
         // becomes a work order to the child already running there.
         const spawnDefs = loadAgentDefaults(params.agent);
-        if (spawnDefs && !spawnDefs.autoExit && spawnDefs.cli !== "claude") {
-          const cwd = canonicalDir(resolveSubagentPaths(params, spawnDefs).effectiveCwd ?? ctx.cwd);
+        const cwd = spawnDefs && !spawnDefs.autoExit && spawnDefs.cli !== "claude"
+          ? canonicalDir(resolveSubagentPaths(params, spawnDefs).effectiveCwd ?? ctx.cwd) : undefined;
+        if (cwd) {
+          if (launchingDirectories.has(cwd)) {
+            return { content: [{ type: "text", text: `A child is already launching in ${cwd}. Send follow-up work to that child after launch.` }], details: { error: "directory launch in progress" } };
+          }
           const existing = [...runningSubagents.values()].find(
             (r) => r.persistent && r.cwd && canonicalDir(r.cwd) === cwd,
           );
@@ -1914,17 +1950,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         } else {
           // Reserve explicit names too: a subagent_message in the same parallel
           // batch waits on the reservation instead of failing during launch.
-          reservedName = params.name;
+          reservedName = params.name.trim();
+          if (reservedNames.has(reservedName) || [...runningSubagents.values()].some((r) => r.name === reservedName)) {
+            return { content: [{ type: "text", text: `A child already uses the name ${reservedName}.` }], details: { error: "child name in use" } };
+          }
+          params.name = reservedName;
           reservedNames.add(reservedName);
         }
 
         // Launch the subagent (creates pane, sends command). Release the name
         // reservation once it registers in runningSubagents (or launch fails) —
         // from then on uniqueRunningName tracks it via the running map.
+        if (cwd) launchingDirectories.add(cwd);
         let running;
         try {
           running = await launchSubagent(params, ctx);
+          labelChild(running, ctx.sessionManager.getSessionId());
         } finally {
+          if (cwd) launchingDirectories.delete(cwd);
           if (reservedName) reservedNames.delete(reservedName);
         }
 
@@ -1948,10 +1991,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
-            updateWidget(); // reflect removal from Map immediately
             // Parent shutdown/reload: this session's pi handle is stale and the
             // child may live on (persistent panes). Report nothing.
             if (result.error === "cancelled") return;
+            updateWidget();
 
             const presentation = resolveResultPresentation(result, running.name);
 
@@ -2282,8 +2325,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        const resumeCwd = !autoExit ? canonicalDir(loadout.cwd ?? ctx.cwd) : undefined;
+        if (resumeCwd) {
+          const existing = [...runningSubagents.values()].find((r) => r.persistent && r.cwd && canonicalDir(r.cwd) === resumeCwd);
+          if (existing) return handleSubagentSteer({ name: existing.name, message });
+          if (launchingDirectories.has(resumeCwd)) {
+            return { content: [{ type: "text", text: `A child is already launching in ${resumeCwd}.` }], details: { error: "directory launch in progress" } };
+          }
+          launchingDirectories.add(resumeCwd);
+        }
+        let surface: string;
+        try {
+          surface = createSurface(name);
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        } finally {
+          if (resumeCwd) launchingDirectories.delete(resumeCwd);
+        }
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
@@ -2379,13 +2436,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           activityFile,
           interactive,
           persistent: !autoExit,
-          cwd: loadout.cwd ?? undefined,
+          cwd: resumeCwd ?? loadout.cwd ?? undefined,
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
           }),
         };
         runningSubagents.set(id, running);
+        labelChild(running, ctx.sessionManager.getSessionId());
         startWidgetRefresh();
         startStatusRefresh(pi);
 
@@ -2395,8 +2453,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
-            updateWidget();
             if (result.error === "cancelled") return; // parent shutdown/reload — see spawn path
+            updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
@@ -2458,11 +2516,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // /orchestrate — spawning tools are inactive by default; enable them only for
   // multi-repo sessions where this session orchestrates per-repo children.
   pi.registerCommand("orchestrate", {
-    description: "Toggle orchestrator mode (subagent tools, on by default): /orchestrate [on|off]",
+    description: "Toggle orchestrator mode or focus a child: /orchestrate [on|off|focus [name]]",
     handler: async (args, ctx) => {
-      const arg = args.trim().toLowerCase();
+      const command = args.trim();
+      if (command === "focus" || command.startsWith("focus ")) {
+        const children = [...runningSubagents.values()];
+        const name = command.slice(5).trim() || await ctx.ui.select("Focus child pane", children.map((child) => child.name));
+        if (!name) return;
+        const child = children.find((child) => child.name === name);
+        if (!child) { ctx.ui.notify(`No open child named ${name}`, "warning"); return; }
+        try { focusSurface(child.surface); } catch { ctx.ui.notify(`Pane ${child.surface} is no longer available`, "warning"); }
+        return;
+      }
+      const arg = command.toLowerCase();
       if (arg && arg !== "on" && arg !== "off") {
-        ctx.ui.notify("Usage: /orchestrate [on|off]", "warning");
+        ctx.ui.notify("Usage: /orchestrate [on|off|focus [name]]", "warning");
         return;
       }
       const on = arg ? arg === "on" : !isOrchestrating();

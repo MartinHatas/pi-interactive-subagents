@@ -16,6 +16,8 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { queueReport } from "./reports.ts";
+import { paneBadge } from "./tmux.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -247,12 +249,13 @@ export default function (pi: ExtensionAPI) {
   // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
   // Persistent (non-auto-exit) children report each orchestrator-initiated turn
-  // back via a `${sessionFile}.report` signal and stay open. The first turn is
+  // back via a `${sessionFile}.reports/` queue and stay open. The first turn is
   // the orchestrator's task; later turns count only when submitted from the
   // inbox (source "extension" + ORCHESTRATOR_MARKER). Turns the human types in
   // the pane stay silent.
   let reportPending = !autoExit;
   let agentRunning = false;
+  let initialTurnEnded = false;
   let inboxTimer: ReturnType<typeof setInterval> | null = null;
   // Set when an inbox message started a turn from idle, cleared on agent_start.
   // pi checks isStreaming only after async input handlers, so a second send in
@@ -268,12 +271,17 @@ export default function (pi: ExtensionAPI) {
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
+    const badge = paneBadge(process.env.TMUX_PANE ?? "");
+    if (badge && subagentName && ctx.hasUI) ctx.ui.setStatus("repo-child", `${badge.ansi}${badge.label} ${subagentName}\x1b[0m`);
 
     // Orchestrator messages arrive through a file inbox, not tmux keystrokes,
     // so delivery never depends on what the pane UI is showing.
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
     if (sessionFile && !inboxTimer) {
       inboxTimer = setInterval(() => {
+        // Pi can run queued follow-ups inside the same agent loop. Wait for
+        // agent_end so each persistent work order gets its own report.
+        if (!autoExit && (!initialTurnEnded || !ctx.isIdle())) return;
         if (Date.now() - inboxStartingAt < 10_000) return;
         const texts = drainInbox(sessionFile);
         if (texts.length === 0) return;
@@ -325,6 +333,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", (event, ctx) => {
+    initialTurnEnded = true;
     agentRunning = false;
     const messages = (event as any).messages as any[] | undefined;
 
@@ -335,16 +344,7 @@ export default function (pi: ExtensionAPI) {
       reportPending = false;
       const aborted = !shouldAutoExitOnAgentEnd(false, messages);
       try {
-        writeFileSync(
-          `${reportFile}.report`,
-          JSON.stringify({
-            name: subagentName,
-            agent: subagentAgent,
-            cwd: process.cwd(),
-            aborted,
-            report: lastAssistantText(messages) || "(no assistant text)",
-          }),
-        );
+        queueReport(reportFile, { aborted, report: lastAssistantText(messages) || "(no assistant text)" });
       } catch {
         // Best effort — the human can still relay the result manually.
       }

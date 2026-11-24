@@ -2854,15 +2854,22 @@ describe("persistent child reporting (subagent-done.ts)", () => {
       fire("agent_start");
       fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: reply }] }] });
     };
-    const takeReport = () => {
-      const file = `${sessionFile}.report`;
-      if (!existsSync(file)) return null;
-      const data = JSON.parse(readFileSync(file, "utf8"));
-      rmSync(file);
-      return data;
+    const { deliverReports } = await import("../pi-extension/subagents/reports.ts");
+    const takeReports = () => {
+      const reports: Array<{ report: string; aborted: boolean }> = [];
+      deliverReports(sessionFile, (report) => reports.push(report));
+      return reports;
     };
-    return { turn, takeReport };
+    return { turn, takeReports, takeReport: () => takeReports()[0] ?? null };
   }
+
+  it("queues both reports when the parent has not read the first", async () => {
+    const child = await bootChild();
+    child.turn("initial", "first");
+    child.turn("[orchestrator] next", "second", "extension");
+    assert.deepEqual(child.takeReports().map(({ report }) => report), ["first", "second"]);
+    assert.deepEqual(child.takeReports(), []);
+  });
 
   it("reports orchestrator turns only, never exits", async () => {
     const child = await bootChild();
@@ -2879,6 +2886,5 @@ describe("persistent child reporting (subagent-done.ts)", () => {
     child.turn("[orchestrator] adopt new field", "Status: partial", "extension");
     const report = child.takeReport();
     assert.equal(report?.report, "Status: partial");
-    assert.equal(report?.name, "svc-a");
   });
 });

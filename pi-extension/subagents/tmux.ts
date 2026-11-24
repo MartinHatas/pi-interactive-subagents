@@ -400,8 +400,13 @@ export async function pollForExit(
           }
         } catch {}
       }
+      const { stdout } = await execFileAsync("tmux", ["list-panes", "-a", "-F", "#{pane_id}"]);
+      if (!stdout.split("\n").includes(surface)) {
+        return { reason: "error", exitCode: 1, errorMessage: "tmux pane closed" };
+      }
     }
 
+    signal.throwIfAborted();
     const elapsed = Math.floor((Date.now() - start) / 1000);
     options.onTick?.(elapsed);
 
@@ -418,4 +423,41 @@ export async function pollForExit(
       signal.addEventListener("abort", onAbort, { once: true });
     });
   }
+}
+
+const badgeColors = ["colour81", "colour213", "colour220", "colour120", "colour117", "colour215"];
+export function paneBadge(surface: string) {
+  if (!/^%\d+$/.test(surface)) return undefined;
+  const id = Number(surface.slice(1));
+  const color = badgeColors[id % badgeColors.length];
+  return { label: `◆${id}`, color, ansi: `\x1b[38;5;${color.slice(6)}m` };
+}
+
+export function focusSurface(surface: string): void {
+  execFileSync("tmux", ["select-pane", "-t", surface]);
+}
+
+export function markChildPane(surface: string, metadata: string, name: string): void {
+  const badge = paneBadge(surface);
+  if (!badge) return;
+  // User options are data; format expressions are fixed and never interpolate names.
+  execFileSync("tmux", ["set-option", "-p", "-t", surface, "@pi-child-state", metadata]);
+  execFileSync("tmux", ["set-option", "-p", "-t", surface, "@pi-child-label", `${badge.label} ${name.replace(/[\x00-\x1f\x7f]/g, " ").replaceAll("#[", "＃[")}`]);
+  execFileSync("tmux", ["set-option", "-p", "-t", surface, "@pi-child-color", badge.color]);
+  // Respect an existing custom border setup.
+  const format = execFileSync("tmux", ["show-options", "-Awv", "-t", surface, "pane-border-format"], { encoding: "utf8" }).trim();
+  const status = execFileSync("tmux", ["show-options", "-Awv", "-t", surface, "pane-border-status"], { encoding: "utf8" }).trim();
+  if (status === "off" && !format.includes("@pi-child-label")) {
+    execFileSync("tmux", ["set-option", "-w", "-t", surface, "pane-border-format", `#{?@pi-child-label,#[fg=#{@pi-child-color}] #{@pi-child-label} #[default],${format}}`]);
+    execFileSync("tmux", ["set-option", "-w", "-t", surface, "pane-border-status", "top"]);
+  }
+}
+
+export function readChildPanes(): Array<{ surface: string; metadata: string }> {
+  if (!isTmuxAvailable() || !process.env.TMUX_PANE) return [];
+  return execFileSync("tmux", ["list-panes", "-t", process.env.TMUX_PANE, "-F", "#{pane_id} #{@pi-child-state}"], { encoding: "utf8" })
+    .split("\n").flatMap((line) => {
+      const split = line.indexOf(" ");
+      return split < 0 || !line.slice(split + 1) ? [] : [{ surface: line.slice(0, split), metadata: line.slice(split + 1) }];
+    });
 }

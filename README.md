@@ -32,7 +32,9 @@ For changes spanning several services, the orchestrator spawns one bundled **`re
 
 Work orders use the sections Goal / Context / Contract / Scope / Out of scope / Acceptance; reports use Status / Changes / Contract changes / Verification / Branch/commit / Open questions (see `agents/repo.md`).
 
-Limitation: after the orchestrator exits or reloads, still-open children keep working but their reports are not re-attached.
+Reloading or resuming the same orchestrator session in its tmux window reconnects live children launched by this version. Pending reports are queued separately so a fast follow-up cannot overwrite an earlier report. Children launched before pane tagging was added must be closed manually.
+
+Each child has a matching colored `◆<pane number>` badge in the parent widget, child footer, and tmux border (unless the window already shows custom borders). Use `/orchestrate focus` to pick a child, or `/orchestrate focus <name>` to jump directly.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
