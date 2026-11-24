@@ -1586,7 +1586,8 @@ function deliverPendingReport(running: RunningSubagent): void {
 function labelChild(running: RunningSubagent, owner: string): void {
   const { id, name, agent, startTime, cwd, sessionFile, activityFile, persistent } = running;
   try {
-    markChildPane(running.surface, persistent ? JSON.stringify({ owner, id, name, agent, startTime, cwd, sessionFile, activityFile }) : "", name);
+    const label = agent === "repo" && cwd ? `${name} (${cwd})` : name;
+    markChildPane(running.surface, persistent ? JSON.stringify({ owner, id, name, agent, startTime, cwd, sessionFile, activityFile }) : "", label);
   } catch {
     latestCtx?.ui.notify(`Could not label or persist pane ${running.surface}`, "warning");
   }
@@ -1765,6 +1766,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           abortController: new AbortController(),
         };
         runningSubagents.set(running.id, running);
+        labelChild(running, owner);
         void watchSubagent(running, running.abortController!.signal).then((result) => {
           if (result.error === "cancelled") return;
           updateWidget();
@@ -2429,6 +2431,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const running: RunningSubagent = {
           id,
           name,
+          agent: loadout.agent ?? undefined,
           task: message,
           surface,
           startTime,
