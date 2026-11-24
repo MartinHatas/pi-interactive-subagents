@@ -15,7 +15,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -110,8 +110,43 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-/** Prefix the orchestrator puts on messages it types into a persistent child's pane. */
+/** Prefix on orchestrator messages the child submits from its inbox. */
 export const ORCHESTRATOR_MARKER = "[orchestrator]";
+
+/**
+ * Take every message queued in `${sessionFile}.inbox` (JSONL, appended by the
+ * parent's subagent_message). Rename first so a concurrent append lands in a
+ * fresh inbox instead of being lost.
+ */
+export function drainInbox(sessionFile: string): string[] {
+  const inbox = `${sessionFile}.inbox`;
+  if (!existsSync(inbox)) return [];
+  const taken = `${inbox}.${process.pid}.${Date.now()}`;
+  try {
+    renameSync(inbox, taken);
+  } catch {
+    return [];
+  }
+  let raw = "";
+  try {
+    raw = readFileSync(taken, "utf8");
+  } finally {
+    try {
+      unlinkSync(taken);
+    } catch {}
+  }
+  const messages: string[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const text = JSON.parse(line)?.text;
+      if (typeof text === "string" && text.trim()) messages.push(text);
+    } catch {
+      // Skip a malformed line rather than dropping the whole batch.
+    }
+  }
+  return messages;
+}
 
 /** Text of the latest assistant message in an agent_end `messages` array. */
 export function lastAssistantText(messages: any[] | undefined): string {
@@ -208,10 +243,12 @@ export default function (pi: ExtensionAPI) {
   let awaitingAnswer = false;
   // Persistent (non-auto-exit) children report each orchestrator-initiated turn
   // back via a `${sessionFile}.report` signal and stay open. The first turn is
-  // the orchestrator's task; later turns count only when typed with
-  // ORCHESTRATOR_MARKER. Turns the human starts in the pane stay silent.
+  // the orchestrator's task; later turns count only when submitted from the
+  // inbox (source "extension" + ORCHESTRATOR_MARKER). Turns the human types in
+  // the pane stay silent.
   let reportPending = !autoExit;
   let agentRunning = false;
+  let inboxTimer: ReturnType<typeof setInterval> | null = null;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -221,13 +258,26 @@ export default function (pi: ExtensionAPI) {
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
+
+    // Orchestrator messages arrive through a file inbox, not tmux keystrokes,
+    // so delivery never depends on what the pane UI is showing.
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (sessionFile && !inboxTimer) {
+      inboxTimer = setInterval(() => {
+        for (const text of drainInbox(sessionFile)) {
+          pi.sendUserMessage(`${ORCHESTRATOR_MARKER} ${text}`, { deliverAs: "followUp" });
+        }
+      }, 500);
+    }
   });
 
   pi.on("input", (event) => {
     recorder.input();
     const text = String((event as any)?.text ?? "");
     if (!autoExit) {
-      if (text.startsWith(ORCHESTRATOR_MARKER)) reportPending = true;
+      if ((event as any)?.source === "extension" && text.startsWith(ORCHESTRATOR_MARKER)) {
+        reportPending = true;
+      }
       // A human prompt on an idle session is their own turn. Mid-run human
       // steers don't cancel an orchestrator turn's report.
       else if (agentStarted && !agentRunning) reportPending = false;
@@ -377,6 +427,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    if (inboxTimer) clearInterval(inboxTimer);
+    inboxTimer = null;
     recorder.sessionShutdown((event as any).reason);
   });
 

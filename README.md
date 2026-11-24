@@ -27,7 +27,7 @@ For changes spanning several services, the orchestrator spawns one bundled **`re
 
 - runs with your full extensions/skills (no `tools:` restriction), so `/diff-review`, MR-comment skills, etc. work in its pane;
 - never auto-exits — the pane stays open until **you** exit it, even if the orchestrator exits or `/reload`s;
-- **reports back per orchestrator turn**: its first task and every `subagent_message` (typed with an `[orchestrator]` prefix) end with the final assistant message delivered to the orchestrator as a `subagent_report` steer. Turns you start in the pane are not reported;
+- **reports back per orchestrator turn**: its first task and every `subagent_message` (delivered via the inbox and submitted with an `[orchestrator]` prefix) end with the final assistant message delivered to the orchestrator as a `subagent_report` steer. Turns you start in the pane are not reported;
 - owns its directory: spawning another persistent agent for the same `cwd` sends the task to the existing child instead.
 
 Work orders use the sections Goal / Context / Contract / Scope / Out of scope / Acceptance; reports use Status / Changes / Contract changes / Verification / Branch/commit / Open questions (see `agents/repo.md`).
@@ -74,7 +74,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running** — the message is queued in the child's `<session>.inbox` file and submitted by the child as a follow-up turn (multi-line preserved), so delivery works regardless of what the pane UI is showing. Claude CLI children fall back to typing into the pane. The call returns immediately; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, result steered back later. Autonomous agents resume autonomous; persistent (`auto-exit: false`) agents resume persistent. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.

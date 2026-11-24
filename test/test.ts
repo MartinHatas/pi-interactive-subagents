@@ -2705,18 +2705,21 @@ describe("multi-repo orchestration", () => {
     assert.deepEqual(entries.map((e) => e.data.on), [true, false]);
   });
 
-  it("prefixes steers to persistent children with the orchestrator marker", () => {
+  it("delivers steers to pi children through the session inbox, not the pane", async () => {
     const testApi = (subagentsModule as any).__test__;
-    const base = {
+    const { drainInbox } = await import("../pi-extension/subagents/subagent-done.ts");
+    const dir = mkdtempSync(join(tmpdir(), "pi-inbox-"));
+    const running = {
       id: "p1", name: "svc-a", task: "", surface: "pane-9", startTime: 0,
-      sessionFile: "a.jsonl", interactive: true,
+      sessionFile: join(dir, "a.jsonl"), interactive: true, persistent: true,
       statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
     };
-    let sent = "";
-    testApi.steerSubagent({ ...base, persistent: true }, "next\nstep", (_s: string, t: string) => { sent = t; });
-    assert.equal(sent, "[orchestrator] next step");
-    testApi.steerSubagent({ ...base, persistent: false }, "next", (_s: string, t: string) => { sent = t; });
-    assert.equal(sent, "next");
+    assert.deepEqual(testApi.steerSubagent(running, "Goal: x\nScope: y"), { ok: true });
+    assert.deepEqual(testApi.steerSubagent(running, "second"), { ok: true });
+    // Newlines survive (no pane typing); both queued messages come out in order.
+    assert.deepEqual(drainInbox(running.sessionFile), ["Goal: x\nScope: y", "second"]);
+    assert.deepEqual(drainInbox(running.sessionFile), []);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it("resumes persistent sessions as persistent, others as autonomous", () => {
@@ -2790,8 +2793,8 @@ describe("persistent child reporting (subagent-done.ts)", () => {
         restoreEnvVar("PI_SUBAGENT_SESSION", prev);
       }
     };
-    const turn = (input: string, reply: string) => {
-      fire("input", { text: input });
+    const turn = (input: string, reply: string, source = "interactive") => {
+      fire("input", { text: input, source });
       fire("agent_start");
       fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: reply }] }] });
     };
@@ -2813,7 +2816,11 @@ describe("persistent child reporting (subagent-done.ts)", () => {
     child.turn("/diff-review", "looks fine");
     assert.equal(child.takeReport(), null);
 
-    child.turn("[orchestrator] adopt new field", "Status: partial");
+    // A human typing the marker is still a human turn.
+    child.turn("[orchestrator] fake", "hi");
+    assert.equal(child.takeReport(), null);
+
+    child.turn("[orchestrator] adopt new field", "Status: partial", "extension");
     const report = child.takeReport();
     assert.equal(report?.report, "Status: partial");
     assert.equal(report?.name, "svc-a");

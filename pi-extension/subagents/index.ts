@@ -12,6 +12,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  appendFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -60,7 +61,6 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { ORCHESTRATOR_MARKER } from "./subagent-done.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1004,26 +1004,30 @@ function resolveRunningByName(name: string):
 }
 
 /**
- * Type a follow-up message into a running subagent's live pane. Newlines are
- * collapsed to spaces because each newline submits a turn in the child's TUI
- * editor; a multi-line message would otherwise fire as several partial turns.
+ * Deliver a follow-up message to a running subagent. Pi children get it via
+ * their `${sessionFile}.inbox` (submitted by subagent-done.ts as a follow-up
+ * turn) so it survives whatever the pane UI is doing — open selectors, half
+ * typed input, scrolled views. Claude CLI children (no inbox) and callers that
+ * inject `send` fall back to typing into the pane, newlines collapsed because
+ * each newline submits a turn in the child's TUI editor.
  */
 function steerSubagent(
   running: RunningSubagent,
   message: string,
-  send: (surface: string, command: string) => void = sendCommand,
+  send?: (surface: string, command: string) => void,
 ): { ok: true } | { error: string } {
-  const flattened = message.replace(/\s*\n\s*/g, " ").trim();
-  // Persistent children only report turns the orchestrator started; the marker
-  // tells them apart from the human typing in the same pane.
-  const text = running.persistent ? `${ORCHESTRATOR_MARKER} ${flattened}` : flattened;
+  const text = message.trim();
   try {
-    send(running.surface, text);
+    if (send || running.cli === "claude") {
+      (send ?? sendCommand)(running.surface, text.replace(/\s*\n\s*/g, " "));
+    } else {
+      appendFileSync(`${running.sessionFile}.inbox`, JSON.stringify({ text }) + "\n");
+    }
     return { ok: true };
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}": ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1031,7 +1035,7 @@ function steerSubagent(
 
 function handleSubagentSteer(
   params: { name?: string; message?: string },
-  send: (surface: string, command: string) => void = sendCommand,
+  send?: (surface: string, command: string) => void,
 ) {
   const message = params.message?.trim();
   if (!message) {
