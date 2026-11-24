@@ -68,23 +68,76 @@ export function shellEscape(s: string): string {
 }
 
 // ── Pane layout ──
+//
+// The parent pi pane (`$TMUX_PANE`) keeps the left column. Subagent panes fill
+// columns to its right, at most SUBAGENT_PANES_PER_COLUMN stacked per column;
+// when every column is full a new full-height column opens at the right edge.
+// Columns share the window width equally; panes in a column share its height.
+
+const SUBAGENT_PANES_PER_COLUMN = 2;
+
+interface PaneGeometry {
+  id: string;
+  left: number;
+  top: number;
+}
+
+/** Panes of the window containing `target`, grouped into columns (left → right, top → bottom). */
+export function groupPanesIntoColumns(panes: PaneGeometry[]): PaneGeometry[][] {
+  const byLeft = new Map<number, PaneGeometry[]>();
+  for (const pane of panes) {
+    const column = byLeft.get(pane.left) ?? [];
+    column.push(pane);
+    byLeft.set(pane.left, column);
+  }
+  return [...byLeft.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, column]) => column.sort((a, b) => a.top - b.top));
+}
+
+function listWindowPanes(target: string): { panes: PaneGeometry[]; width: number; height: number } {
+  const out = execFileSync(
+    "tmux",
+    ["list-panes", "-t", target, "-F", "#{pane_id} #{pane_left} #{pane_top} #{window_width} #{window_height}"],
+    { encoding: "utf8" },
+  );
+  let width = 0;
+  let height = 0;
+  const panes = out
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [id, left, top, w, h] = line.split(" ");
+      width = Number(w);
+      height = Number(h);
+      return { id, left: Number(left), top: Number(top) };
+    });
+  return { panes, width, height };
+}
 
 /**
- * tmux layout applied to the subagent window to keep panes evenly sized.
- * Switchable: "even-horizontal" (equal columns, matches Ctrl+b Alt+1),
- * "main-vertical" (big main pane + tiled column), "tiled" (grid).
+ * Pick where the next subagent pane goes: below the top pane of the first
+ * subagent column that still has room, else a new column at the right edge.
  */
-const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
+export function chooseSubagentSplit(
+  columns: PaneGeometry[][],
+  rootLeft: number,
+): { direction: "down"; from: string } | { direction: "new-column" } {
+  const open = columns.find(
+    (column) => column[0].left > rootLeft && column.length < SUBAGENT_PANES_PER_COLUMN,
+  );
+  return open ? { direction: "down", from: open[open.length - 1].id } : { direction: "new-column" };
+}
 
 let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
- * Re-balance subagent panes so repeated splits don't leave them lopsided.
+ * Equalize column widths and per-column pane heights in the parent pi window.
  * tmux halves the target pane on every split and dumps freed space onto a
- * neighbor on close, so without this panes drift to wildly uneven widths.
- * Applies SUBAGENT_TMUX_LAYOUT to the parent pi window. Debounced so a burst
- * of parallel spawns or staggered exits collapses into a single layout call,
- * and non-fatal: a cosmetic resize must never break spawning or watching.
+ * neighbor on close, so without this panes drift to uneven sizes. Debounced
+ * so bursts of spawns/exits collapse into one pass, and non-fatal: a cosmetic
+ * resize must never break spawning or watching.
  */
 function rebalanceSurfaces(hintPane?: string): void {
   // Prefer the parent pi pane (stable; survives a closing subagent pane).
@@ -94,10 +147,18 @@ function rebalanceSurfaces(hintPane?: string): void {
   rebalanceTimer = setTimeout(() => {
     rebalanceTimer = null;
     try {
-      // -t <pane> resolves to that pane's window; does not change focus.
-      execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
-        encoding: "utf8",
-      });
+      const { panes, width, height } = listWindowPanes(target);
+      const columns = groupPanesIntoColumns(panes);
+      const columnWidth = Math.floor((width - (columns.length - 1)) / columns.length);
+      for (const column of columns.slice(0, -1)) {
+        execFileSync("tmux", ["resize-pane", "-t", column[0].id, "-x", String(columnWidth)]);
+      }
+      for (const column of columns) {
+        const paneHeight = Math.floor((height - (column.length - 1)) / column.length);
+        for (const pane of column.slice(0, -1)) {
+          execFileSync("tmux", ["resize-pane", "-t", pane.id, "-y", String(paneHeight)]);
+        }
+      }
     } catch {
       // Pane/window may be gone; balancing is best-effort.
     }
@@ -107,15 +168,18 @@ function rebalanceSurfaces(hintPane?: string): void {
 // ── Surface primitives ──
 
 /**
- * Create a new pane for a subagent: a right split off the parent pi's pane,
- * so new panes follow the agent rather than the user's focus.
- * See https://github.com/HazAT/pi-interactive-subagents/issues/12
- *
- * Returns the new pane id (e.g. `%12`).
+ * Create a new pane for a subagent in the parent pi's window (never steals
+ * focus). See the layout notes above. Returns the new pane id (e.g. `%12`).
  */
 export function createSurface(name: string): string {
-  void name; // tmux panes are not named; the pi process inside shows its own title.
-  return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
+  const root = process.env.TMUX_PANE;
+  if (!root) return createSurfaceSplit(name, "right");
+  requireTmux();
+  const { panes } = listWindowPanes(root);
+  const rootLeft = panes.find((pane) => pane.id === root)?.left ?? 0;
+  const choice = chooseSubagentSplit(groupPanesIntoColumns(panes), rootLeft);
+  if (choice.direction === "down") return createSurfaceSplit(name, "down", choice.from);
+  return createSurfaceSplit(name, "right", root, { fullHeight: true });
 }
 
 /**
@@ -126,11 +190,14 @@ export function createSurfaceSplit(
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
+  options?: { fullHeight?: boolean },
 ): string {
   void name;
   requireTmux();
 
   const args = ["split-window", "-d"];
+  // -f: span the full window height, opening a new column at the edge.
+  if (options?.fullHeight) args.push("-f");
   if (direction === "left" || direction === "right") {
     args.push("-h");
   } else {

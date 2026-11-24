@@ -110,6 +110,29 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/** Prefix the orchestrator puts on messages it types into a persistent child's pane. */
+export const ORCHESTRATOR_MARKER = "[orchestrator]";
+
+/** Text of the latest assistant message in an agent_end `messages` array. */
+export function lastAssistantText(messages: any[] | undefined): string {
+  if (!messages) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role !== "assistant") continue;
+    const content = msg.content;
+    if (typeof content === "string") return content.trim();
+    if (Array.isArray(content)) {
+      return content
+        .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+        .map((part: any) => part.text)
+        .join("\n")
+        .trim();
+    }
+    return "";
+  }
+  return "";
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -183,6 +206,12 @@ export default function (pi: ExtensionAPI) {
   // lands — on `input` (covers a reply steered into the current run) and on
   // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
+  // Persistent (non-auto-exit) children report each orchestrator-initiated turn
+  // back via a `${sessionFile}.report` signal and stay open. The first turn is
+  // the orchestrator's task; later turns count only when typed with
+  // ORCHESTRATOR_MARKER. Turns the human starts in the pane stay silent.
+  let reportPending = !autoExit;
+  let agentRunning = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -194,8 +223,15 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  pi.on("input", () => {
+  pi.on("input", (event) => {
     recorder.input();
+    const text = String((event as any)?.text ?? "");
+    if (!autoExit) {
+      if (text.startsWith(ORCHESTRATOR_MARKER)) reportPending = true;
+      // A human prompt on an idle session is their own turn. Mid-run human
+      // steers don't cancel an orchestrator turn's report.
+      else if (agentStarted && !agentRunning) reportPending = false;
+    }
     // A submitted message is the orchestrator's (or a human's) reply — the
     // pending ask_question has been answered, however it was delivered. Clear
     // here, not only on agent_start, because a reply steered in *mid-run* is
@@ -217,6 +253,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    agentRunning = true;
     // A new turn is starting — any pending ask_question has now been answered
     // (or superseded), so let auto-exit resume normally when this turn ends.
     awaitingAnswer = false;
@@ -224,7 +261,30 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", (event, ctx) => {
+    agentRunning = false;
     const messages = (event as any).messages as any[] | undefined;
+
+    // Report to the orchestrator without exiting. Skip while an ask_question is
+    // pending (the question already went up; the reply re-arms the report).
+    const reportFile = process.env.PI_SUBAGENT_SESSION;
+    if (!autoExit && reportPending && !awaitingAnswer && reportFile) {
+      reportPending = false;
+      const aborted = !shouldAutoExitOnAgentEnd(false, messages);
+      try {
+        writeFileSync(
+          `${reportFile}.report`,
+          JSON.stringify({
+            name: subagentName,
+            agent: subagentAgent,
+            cwd: process.cwd(),
+            aborted,
+            report: lastAssistantText(messages) || "(no assistant text)",
+          }),
+        );
+      } catch {
+        // Best effort — the human can still relay the result manually.
+      }
+    }
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
     //  - runningChildrenCount(): this subagent spawned its own children and is

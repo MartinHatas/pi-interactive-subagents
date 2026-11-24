@@ -60,6 +60,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import { ORCHESTRATOR_MARKER } from "./subagent-done.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -160,6 +161,9 @@ const SPAWNING_TOOLS = [
   "subagent_message",
   "subagents_list",
 ] as const;
+
+/** Custom session entry recording /orchestrate on/off. */
+const ORCHESTRATE_ENTRY = "subagents-orchestrate";
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
@@ -626,6 +630,14 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /**
+   * Non-auto-exit pi child (e.g. the `repo` agent). Reports each
+   * orchestrator-initiated turn via `.report` and keeps its pane open — even
+   * across orchestrator exit/reload. Only the human closes it.
+   */
+  persistent?: boolean;
+  /** Resolved working directory the child runs in. */
+  cwd?: string;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -1002,8 +1014,11 @@ function steerSubagent(
   send: (surface: string, command: string) => void = sendCommand,
 ): { ok: true } | { error: string } {
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
+  // Persistent children only report turns the orchestrator started; the marker
+  // tells them apart from the human typing in the same pane.
+  const text = running.persistent ? `${ORCHESTRATOR_MARKER} ${flattened}` : flattened;
   try {
-    send(running.surface, flattened);
+    send(running.surface, text);
     return { ok: true };
   } catch (error: any) {
     return {
@@ -1111,11 +1126,14 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
-// Resuming a finished session is always autonomous: the relaunched agent runs
-// its follow-up task to completion and the harness delivers the result as a
-// steer message (fire-and-forget). An interactive resume would park the pane
-// waiting for the user, contradicting that result-delivery model.
-function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolean } {
+// Resuming a finished session replays its original exit mode. Autonomous agents
+// run the follow-up to completion and the harness delivers the result as a
+// steer message. Persistent (non-auto-exit) agents reopen as a persistent pane
+// that reports back per orchestrator turn and stays open for the human.
+function resolveResumeLaunchBehavior(
+  loadout?: { autoExit?: boolean } | null,
+): { autoExit: boolean; interactive: boolean } {
+  if (loadout && loadout.autoExit === false) return { autoExit: false, interactive: true };
   return { autoExit: true, interactive: false };
 }
 
@@ -1443,6 +1461,8 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
+    persistent: !agentDefs?.autoExit,
+    cwd: targetCwdForSession,
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1521,6 +1541,38 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+/**
+ * Deliver a persistent child's per-turn report (`${sessionFile}.report`,
+ * written by subagent-done.ts) to the orchestrator. The child keeps running.
+ */
+function deliverPendingReport(running: RunningSubagent): void {
+  const reportFile = `${running.sessionFile}.report`;
+  let payload: any = null;
+  try {
+    if (!existsSync(reportFile)) return;
+    payload = JSON.parse(readFileSync(reportFile, "utf-8"));
+  } catch {}
+  try {
+    unlinkSync(reportFile);
+  } catch {}
+  if (typeof payload?.report !== "string") return;
+
+  const name = running.name;
+  const where = payload.cwd ?? running.cwd ?? "";
+  const abortedNote = payload.aborted ? " (turn aborted by the user in the pane)" : "";
+  latestPi?.sendMessage(
+    {
+      customType: "subagent_report",
+      content:
+        `Sub-agent "${name}"${where ? ` [${where}]` : ""} reports${abortedNote}:\n\n${payload.report}` +
+        `\n\nIts pane stays open for the user. Send the next work order with subagent_message({ name: "${name}", message: "…" }).`,
+      display: true,
+      details: { name, agent: running.agent, cwd: where, aborted: !!payload.aborted },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1535,6 +1587,7 @@ async function watchSubagent(
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
+        deliverPendingReport(running);
       },
     });
 
@@ -1613,9 +1666,13 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    try {
-      closeSurface(surface);
-    } catch {}
+    // Orchestrator exit/reload aborts the watcher. Persistent panes belong to
+    // the human from then on — leave them open.
+    if (!(running.persistent && (signal.aborted || getModuleAbortSignal().aborted))) {
+      try {
+        closeSurface(surface);
+      } catch {}
+    }
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -1642,9 +1699,25 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
+
+  const isOrchestrating = () => pi.getActiveTools().includes("subagent");
+  const setOrchestrating = (on: boolean) => {
+    const active = new Set(pi.getActiveTools());
+    for (const tool of SPAWNING_TOOLS) on ? active.add(tool) : active.delete(tool);
+    pi.setActiveTools([...active]);
+  };
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    // Restore /orchestrate state persisted in this session branch.
+    let orchestrate: boolean | undefined;
+    for (const entry of ctx.sessionManager.getBranch() as any[]) {
+      if (entry?.type === "custom" && entry.customType === ORCHESTRATE_ENTRY) {
+        orchestrate = !!entry.data?.on;
+      }
+    }
+    if (orchestrate !== undefined) setOrchestrating(orchestrate);
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -1684,6 +1757,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.registerTool({
       name: "subagent",
       label: "Subagent",
+      defaultActive: false,
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
@@ -1699,6 +1773,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       parameters: SubagentParams,
+      promptGuidelines: [
+        "Multi-repo work: spawn one `repo` agent per directory (cwd = absolute repo path, name = repo directory name). Never give two children the same directory.",
+        "Send each `repo` child a work order with sections: Goal, Context (why + which other services are involved), Contract (exact API/schema/event shapes shared with other repos), Scope (files/areas to change), Out of scope, Acceptance (how to verify, which tests to run).",
+        "Order work by dependency: change the provider side of a contract first, then pass its reported contract changes verbatim into the consumers' work orders.",
+        "`repo` children stay open after reporting; the user reviews and steers them directly. Send follow-up work with subagent_message to the same name. Never ask a child to exit.",
+      ],
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         // Prevent self-spawning (e.g. planner spawning another planner)
@@ -1756,6 +1836,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
             },
           };
+        }
+
+        // Persistent agents own their directory: a second spawn for the same cwd
+        // becomes a work order to the child already running there.
+        const spawnDefs = loadAgentDefaults(params.agent);
+        if (spawnDefs && !spawnDefs.autoExit && spawnDefs.cli !== "claude") {
+          const cwd = resolve(resolveSubagentPaths(params, spawnDefs).effectiveCwd ?? ctx.cwd);
+          const existing = [...runningSubagents.values()].find(
+            (r) => r.persistent && r.cwd && resolve(r.cwd) === cwd,
+          );
+          if (existing) {
+            const steered = handleSubagentSteer({ name: existing.name, message: params.task });
+            const note = `A persistent subagent "${existing.name}" already runs in ${cwd}; the task was sent to it instead of spawning a new one. `;
+            return {
+              ...steered,
+              content: [{ type: "text" as const, text: note + steered.content[0].text }],
+            };
+          }
         }
 
         // Validate prerequisites (need mux + a session file to derive the
@@ -1952,6 +2050,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // ── subagents_list tool ──
   pi.registerTool({
       name: "subagents_list",
+      defaultActive: false,
       label: "List Subagents",
       description:
         "List all available subagent definitions. " +
@@ -2007,6 +2106,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // ── subagent_message tool ──
   pi.registerTool({
       name: "subagent_message",
+      defaultActive: false,
       label: "Message Subagent",
       description:
         "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes, " +
@@ -2092,7 +2192,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // ── Resume a finished session by name ──
         const message = params.message;
         const name = requestedName; // identity preservation: the resumed run reclaims its name
-        const { autoExit, interactive } = resolveResumeLaunchBehavior();
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
@@ -2142,6 +2241,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        const { autoExit, interactive } = resolveResumeLaunchBehavior(loadout);
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
         // Record entry count before resuming so we can extract new messages.
@@ -2245,6 +2345,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
+          persistent: !autoExit,
+          cwd: loadout.cwd ?? undefined,
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
@@ -2318,6 +2420,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+
+  // /orchestrate — spawning tools are inactive by default; enable them only for
+  // multi-repo sessions where this session orchestrates per-repo children.
+  pi.registerCommand("orchestrate", {
+    description: "Toggle orchestrator mode (subagent tools): /orchestrate [on|off]",
+    handler: async (args, ctx) => {
+      const arg = args.trim().toLowerCase();
+      if (arg && arg !== "on" && arg !== "off") {
+        ctx.ui.notify("Usage: /orchestrate [on|off]", "warning");
+        return;
+      }
+      const on = arg ? arg === "on" : !isOrchestrating();
+      setOrchestrating(on);
+      pi.appendEntry(ORCHESTRATE_ENTRY, { on });
+      ctx.ui.notify(`Orchestrator mode ${on ? "on" : "off"}`, "info");
+    },
+  });
 
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {

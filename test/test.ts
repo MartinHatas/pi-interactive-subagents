@@ -2676,3 +2676,146 @@ describe("tmux.ts", () => {
     });
   });
 });
+
+describe("multi-repo orchestration", () => {
+  it("spawning tools are registered inactive until /orchestrate", () => {
+    const { api, registeredTools, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    for (const name of ["subagent", "subagent_message", "subagents_list"]) {
+      assert.equal(registeredTools.find((t) => t.name === name)?.defaultActive, false, name);
+    }
+    assert.ok(registeredCommands.find((c) => c.name === "orchestrate"));
+  });
+
+  it("/orchestrate toggles spawning tools and persists the state", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    let active = ["read", "bash"];
+    const entries: any[] = [];
+    api.getActiveTools = () => active;
+    api.setActiveTools = (names: string[]) => { active = names; };
+    api.appendEntry = (customType: string, data: any) => entries.push({ customType, data });
+    (subagentsModule as any).default(api);
+    const cmd = registeredCommands.find((c) => c.name === "orchestrate");
+    const ctx = { ui: { notify() {} } };
+
+    await cmd.handler("", ctx);
+    assert.deepEqual([...active].sort(), ["bash", "read", "subagent", "subagent_message", "subagents_list"]);
+    await cmd.handler("off", ctx);
+    assert.deepEqual(active, ["read", "bash"]);
+    assert.deepEqual(entries.map((e) => e.data.on), [true, false]);
+  });
+
+  it("prefixes steers to persistent children with the orchestrator marker", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const base = {
+      id: "p1", name: "svc-a", task: "", surface: "pane-9", startTime: 0,
+      sessionFile: "a.jsonl", interactive: true,
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+    };
+    let sent = "";
+    testApi.steerSubagent({ ...base, persistent: true }, "next\nstep", (_s: string, t: string) => { sent = t; });
+    assert.equal(sent, "[orchestrator] next step");
+    testApi.steerSubagent({ ...base, persistent: false }, "next", (_s: string, t: string) => { sent = t; });
+    assert.equal(sent, "next");
+  });
+
+  it("resumes persistent sessions as persistent, others as autonomous", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: false }), { autoExit: false, interactive: true });
+    assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: true }), { autoExit: true, interactive: false });
+  });
+
+  it("ships a persistent repo agent with the full default toolset", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const repo = testApi.discoverAgentDefinitions().find((a: any) => a.name === "repo");
+    assert.ok(repo);
+    assert.equal(repo.autoExit, false);
+    assert.equal(repo.tools, undefined);
+  });
+});
+
+describe("tmux column layout", () => {
+  it("groups panes into columns and fills each up to two before opening a new one", async () => {
+    const { groupPanesIntoColumns, chooseSubagentSplit } = await import("../pi-extension/subagents/tmux.ts");
+    const pane = (id: string, left: number, top: number) => ({ id, left, top });
+
+    // Only the orchestrator → new column.
+    assert.deepEqual(chooseSubagentSplit(groupPanesIntoColumns([pane("%0", 0, 0)]), 0), { direction: "new-column" });
+
+    // One child in column 1 → stack below it.
+    const one = groupPanesIntoColumns([pane("%0", 0, 0), pane("%1", 80, 0)]);
+    assert.deepEqual(chooseSubagentSplit(one, 0), { direction: "down", from: "%1" });
+
+    // Column 1 full → new column.
+    const two = groupPanesIntoColumns([pane("%0", 0, 0), pane("%2", 80, 25), pane("%1", 80, 0)]);
+    assert.deepEqual(two[1].map((p) => p.id), ["%1", "%2"]);
+    assert.deepEqual(chooseSubagentSplit(two, 0), { direction: "new-column" });
+
+    // A pane closed in column 1 → refill it before using column 2's slot.
+    const gap = groupPanesIntoColumns([pane("%0", 0, 0), pane("%2", 60, 0), pane("%3", 120, 0), pane("%4", 120, 25)]);
+    assert.deepEqual(chooseSubagentSplit(gap, 0), { direction: "down", from: "%2" });
+  });
+});
+
+describe("persistent child reporting (subagent-done.ts)", () => {
+  async function bootChild() {
+    const dir = mkdtempSync(join(tmpdir(), "pi-report-"));
+    const sessionFile = join(dir, "child.jsonl");
+    const saved = {
+      session: process.env.PI_SUBAGENT_SESSION,
+      autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+      name: process.env.PI_SUBAGENT_NAME,
+    };
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_NAME = "svc-a";
+    delete process.env.PI_SUBAGENT_AUTO_EXIT;
+    const handlers = new Map<string, Function>();
+    const mod = await import("../pi-extension/subagents/subagent-done.ts");
+    mod.default({
+      on: (event: string, fn: Function) => handlers.set(event, fn),
+      registerShortcut() {},
+      registerTool() {},
+      getAllTools: () => [],
+    } as any);
+    restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
+    restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+    restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
+    // Handlers read PI_SUBAGENT_SESSION at call time.
+    const fire = (event: string, payload: any = {}) => {
+      const prev = process.env.PI_SUBAGENT_SESSION;
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+      try {
+        handlers.get(event)?.(payload, { shutdown() { throw new Error("must not exit"); } });
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_SESSION", prev);
+      }
+    };
+    const turn = (input: string, reply: string) => {
+      fire("input", { text: input });
+      fire("agent_start");
+      fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: reply }] }] });
+    };
+    const takeReport = () => {
+      const file = `${sessionFile}.report`;
+      if (!existsSync(file)) return null;
+      const data = JSON.parse(readFileSync(file, "utf8"));
+      rmSync(file);
+      return data;
+    };
+    return { turn, takeReport };
+  }
+
+  it("reports orchestrator turns only, never exits", async () => {
+    const child = await bootChild();
+    child.turn("@/tmp/task.md", "Status: done");
+    assert.equal(child.takeReport()?.report, "Status: done");
+
+    child.turn("/diff-review", "looks fine");
+    assert.equal(child.takeReport(), null);
+
+    child.turn("[orchestrator] adopt new field", "Status: partial");
+    const report = child.takeReport();
+    assert.equal(report?.report, "Status: partial");
+    assert.equal(report?.name, "svc-a");
+  });
+});

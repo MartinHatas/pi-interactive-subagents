@@ -17,7 +17,22 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+Layout: the parent pi pane keeps the left column; subagent panes fill columns to its right, two stacked per column, and a new full-height column opens when all are full. Column widths and per-column heights are re-equalized after every spawn and exit (debounced). See `SUBAGENT_PANES_PER_COLUMN` in `pi-extension/subagents/tmux.ts`.
+
+## Orchestrator mode (multi-repo)
+
+Spawning tools (`subagent`, `subagent_message`, `subagents_list`) are **inactive by default**. Run `/orchestrate` (or `/orchestrate on|off`) to toggle them for the current session; the state is persisted in the session.
+
+For changes spanning several services, the orchestrator spawns one bundled **`repo`** agent per directory (`cwd` = repo path). A `repo` child:
+
+- runs with your full extensions/skills (no `tools:` restriction), so `/diff-review`, MR-comment skills, etc. work in its pane;
+- never auto-exits — the pane stays open until **you** exit it, even if the orchestrator exits or `/reload`s;
+- **reports back per orchestrator turn**: its first task and every `subagent_message` (typed with an `[orchestrator]` prefix) end with the final assistant message delivered to the orchestrator as a `subagent_report` steer. Turns you start in the pane are not reported;
+- owns its directory: spawning another persistent agent for the same `cwd` sends the task to the existing child instead.
+
+Work orders use the sections Goal / Context / Contract / Scope / Out of scope / Acceptance; reports use Status / Changes / Contract changes / Verification / Branch/commit / Open questions (see `agents/repo.md`).
+
+Limitation: after the orchestrator exits or reloads, still-open children keep working but their reports are not re-attached.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -60,7 +75,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
 - **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
-- **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
+- **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, result steered back later. Autonomous agents resume autonomous; persistent (`auto-exit: false`) agents resume persistent. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
@@ -79,8 +94,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
 | **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
 | **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **repo** | session default | full default toolset | Persistent per-repo agent for orchestrator mode (`auto-exit: false`) |
 
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+scout, researcher and worker are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
 ## Custom agents
 
