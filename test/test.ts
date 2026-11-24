@@ -2722,6 +2722,57 @@ describe("multi-repo orchestration", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("orchestrator mode is on by default at top level, with a duck footer status, and honours a persisted off", () => {
+    const boot = (entries: any[], subagentSession?: string) => {
+      const { api } = createMockExtensionApi();
+      const handlers = new Map<string, Function>();
+      let active = ["read"];
+      const status: Record<string, string | undefined> = {};
+      api.on = (event: string, fn: Function) => handlers.set(event, fn);
+      api.getActiveTools = () => active;
+      api.setActiveTools = (names: string[]) => { active = names; };
+      (subagentsModule as any).default(api);
+      const saved = process.env.PI_SUBAGENT_SESSION;
+      if (subagentSession) process.env.PI_SUBAGENT_SESSION = subagentSession;
+      else delete process.env.PI_SUBAGENT_SESSION;
+      try {
+        handlers.get("session_start")!({}, {
+          hasUI: true,
+          ui: { setStatus: (key: string, text?: string) => { status[key] = text; }, setWidget() {} },
+          sessionManager: { getBranch: () => entries },
+        });
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_SESSION", saved);
+      }
+      return { active, status };
+    };
+
+    const fresh = boot([]);
+    assert.ok(fresh.active.includes("subagent"));
+    assert.equal(fresh.status.orchestrator, "🦆 orchestrator: ON");
+
+    const off = boot([{ type: "custom", customType: "subagents-orchestrate", data: { on: false } }]);
+    assert.equal(off.active.includes("subagent"), false);
+    assert.equal(off.status.orchestrator, "🦆 orchestrator: OFF");
+
+    const child = boot([], "/tmp/child.jsonl");
+    assert.equal(child.active.includes("subagent"), false);
+    assert.equal(child.status.orchestrator, undefined);
+  });
+
+  it("canonicalDir treats a symlinked path and its target as one directory", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const { symlinkSync, realpathSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "pi-canon-"));
+    mkdirSync(join(dir, "real"));
+    symlinkSync(join(dir, "real"), join(dir, "link"));
+    assert.equal(testApi.canonicalDir(join(dir, "link")), realpathSync(join(dir, "real")));
+    assert.equal(testApi.canonicalDir(join(dir, "real", "..", "real")), realpathSync(join(dir, "real")));
+    // Missing dirs fall back to a plain resolve instead of throwing.
+    assert.equal(testApi.canonicalDir("/nonexistent/x/../y"), "/nonexistent/y");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it("resumes persistent sessions as persistent, others as autonomous", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: false }), { autoExit: false, interactive: true });
@@ -2761,6 +2812,11 @@ describe("tmux column layout", () => {
 });
 
 describe("persistent child reporting (subagent-done.ts)", () => {
+  it("batches queued inbox messages into one marked user message", async () => {
+    const { formatInboxBatch } = await import("../pi-extension/subagents/subagent-done.ts");
+    assert.equal(formatInboxBatch(["a", "b"]), "[orchestrator] a\n\n[orchestrator] b");
+  });
+
   async function bootChild() {
     const dir = mkdtempSync(join(tmpdir(), "pi-report-"));
     const sessionFile = join(dir, "child.jsonl");

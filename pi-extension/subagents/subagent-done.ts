@@ -113,6 +113,11 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
 /** Prefix on orchestrator messages the child submits from its inbox. */
 export const ORCHESTRATOR_MARKER = "[orchestrator]";
 
+/** Join queued orchestrator messages into one user message. */
+export function formatInboxBatch(texts: string[]): string {
+  return texts.map((text) => `${ORCHESTRATOR_MARKER} ${text}`).join("\n\n");
+}
+
 /**
  * Take every message queued in `${sessionFile}.inbox` (JSONL, appended by the
  * parent's subagent_message). Rename first so a concurrent append lands in a
@@ -249,6 +254,11 @@ export default function (pi: ExtensionAPI) {
   let reportPending = !autoExit;
   let agentRunning = false;
   let inboxTimer: ReturnType<typeof setInterval> | null = null;
+  // Set when an inbox message started a turn from idle, cleared on agent_start.
+  // pi checks isStreaming only after async input handlers, so a second send in
+  // that window would also try to start a turn and be dropped.
+  // shortcut: expires after 10s in case the turn never starts (send failed); a smarter retry is only needed if that shows up in practice.
+  let inboxStartingAt = 0;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -264,9 +274,12 @@ export default function (pi: ExtensionAPI) {
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
     if (sessionFile && !inboxTimer) {
       inboxTimer = setInterval(() => {
-        for (const text of drainInbox(sessionFile)) {
-          pi.sendUserMessage(`${ORCHESTRATOR_MARKER} ${text}`, { deliverAs: "followUp" });
-        }
+        if (Date.now() - inboxStartingAt < 10_000) return;
+        const texts = drainInbox(sessionFile);
+        if (texts.length === 0) return;
+        if (ctx.isIdle()) inboxStartingAt = Date.now();
+        // One message per batch: several sends in one tick race each other.
+        pi.sendUserMessage(formatInboxBatch(texts), { deliverAs: "followUp" });
       }, 500);
     }
   });
@@ -302,6 +315,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
+    inboxStartingAt = 0;
     agentStarted = true;
     agentRunning = true;
     // A new turn is starting — any pending ask_question has now been answered

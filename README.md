@@ -21,7 +21,7 @@ Layout: the parent pi pane keeps the left column; subagent panes fill columns to
 
 ## Orchestrator mode (multi-repo)
 
-Spawning tools (`subagent`, `subagent_message`, `subagents_list`) are **inactive by default**. Run `/orchestrate` (or `/orchestrate on|off`) to toggle them for the current session; the state is persisted in the session.
+Spawning tools (`subagent`, `subagent_message`, `subagents_list`) are **on by default in top-level sessions** and off in subagent sessions (unless their `--tools` grants them). The footer shows `🦆 orchestrator: ON|OFF`. `/orchestrate` (or `/orchestrate on|off`) toggles it; the choice is persisted in the session.
 
 For changes spanning several services, the orchestrator spawns one bundled **`repo`** agent per directory (`cwd` = repo path). A `repo` child:
 

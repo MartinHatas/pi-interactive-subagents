@@ -13,6 +13,7 @@ import {
   copyFileSync,
   unlinkSync,
   appendFileSync,
+  realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -350,6 +351,15 @@ function resolveSubagentPaths(
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
   return { effectiveCwd, localAgentDir, effectiveAgentDir };
+}
+
+/** Absolute path with symlinks resolved (macOS /tmp → /private/tmp), so one repo has one key. */
+function canonicalDir(dir: string): string {
+  try {
+    return realpathSync(dir);
+  } catch {
+    return resolve(dir);
+  }
 }
 
 function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
@@ -1157,6 +1167,7 @@ export const __test__ = {
   observeRunningSubagent,
   getToolExtensionPath,
   resolveRunningByName,
+  canonicalDir,
   uniqueRunningName,
   reservedNames,
   steerSubagent,
@@ -1705,10 +1716,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
 
   const isOrchestrating = () => pi.getActiveTools().includes("subagent");
-  const setOrchestrating = (on: boolean) => {
+  const setOrchestrating = (on: boolean, ctx?: { hasUI?: boolean; ui: { setStatus: Function } }) => {
     const active = new Set(pi.getActiveTools());
     for (const tool of SPAWNING_TOOLS) on ? active.add(tool) : active.delete(tool);
     pi.setActiveTools([...active]);
+    if (ctx?.hasUI) ctx.ui.setStatus("orchestrator", `🦆 orchestrator: ${on ? "ON" : "OFF"}`);
   };
 
   // Capture the UI context for widget updates
@@ -1721,7 +1733,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         orchestrate = !!entry.data?.on;
       }
     }
-    if (orchestrate !== undefined) setOrchestrating(orchestrate);
+    // Default: on for top-level sessions. Subagents (PI_SUBAGENT_SESSION) keep
+    // whatever their --tools allowlist grants and show no footer status.
+    if (!process.env.PI_SUBAGENT_SESSION) setOrchestrating(orchestrate ?? true, ctx);
+    else if (orchestrate !== undefined) setOrchestrating(orchestrate);
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -1846,9 +1861,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // becomes a work order to the child already running there.
         const spawnDefs = loadAgentDefaults(params.agent);
         if (spawnDefs && !spawnDefs.autoExit && spawnDefs.cli !== "claude") {
-          const cwd = resolve(resolveSubagentPaths(params, spawnDefs).effectiveCwd ?? ctx.cwd);
+          const cwd = canonicalDir(resolveSubagentPaths(params, spawnDefs).effectiveCwd ?? ctx.cwd);
           const existing = [...runningSubagents.values()].find(
-            (r) => r.persistent && r.cwd && resolve(r.cwd) === cwd,
+            (r) => r.persistent && r.cwd && canonicalDir(r.cwd) === cwd,
           );
           if (existing) {
             const steered = handleSubagentSteer({ name: existing.name, message: params.task });
@@ -2432,7 +2447,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // /orchestrate — spawning tools are inactive by default; enable them only for
   // multi-repo sessions where this session orchestrates per-repo children.
   pi.registerCommand("orchestrate", {
-    description: "Toggle orchestrator mode (subagent tools): /orchestrate [on|off]",
+    description: "Toggle orchestrator mode (subagent tools, on by default): /orchestrate [on|off]",
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
       if (arg && arg !== "on" && arg !== "off") {
@@ -2440,7 +2455,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return;
       }
       const on = arg ? arg === "on" : !isOrchestrating();
-      setOrchestrating(on);
+      setOrchestrating(on, ctx);
       pi.appendEntry(ORCHESTRATE_ENTRY, { on });
       ctx.ui.notify(`Orchestrator mode ${on ? "on" : "off"}`, "info");
     },
