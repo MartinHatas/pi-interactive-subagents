@@ -756,7 +756,8 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
-    const agentTag = agent.agent ? ` (${agent.agent})` : "";
+    const location = agent.agent === "repo" ? agent.cwd ?? agent.agent : agent.agent;
+    const agentTag = location ? ` (${location})` : "";
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
     const badge = paneBadge(agent.surface);

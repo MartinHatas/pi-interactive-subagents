@@ -2491,6 +2491,16 @@ describe("subagent startup delay", () => {
   });
 });
 describe("subagents widget rendering", () => {
+  it("shows the working directory instead of the repo profile name", () => {
+    const lines = subagentsModule.__test__.renderSubagentWidgetLines([{
+      id: "repo-1", name: "orders", task: "", agent: "repo", cwd: "/tmp/repos/orders",
+      surface: "%36", startTime: Date.now(), sessionFile: "orders.jsonl", interactive: true,
+      statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+    }], 120);
+    assert.match(lines[1], /\(\/tmp\/repos\/orders\)/);
+    assert.doesNotMatch(lines[1], /\(repo\)/);
+  });
+
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
