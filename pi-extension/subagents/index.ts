@@ -1911,6 +1911,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           params.name = uniqueRunningName(params.agent, registryNames);
           reservedName = params.name;
           reservedNames.add(reservedName);
+        } else {
+          // Reserve explicit names too: a subagent_message in the same parallel
+          // batch waits on the reservation instead of failing during launch.
+          reservedName = params.name;
+          reservedNames.add(reservedName);
         }
 
         // Launch the subagent (creates pane, sends command). Release the name
@@ -2202,6 +2207,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
+        }
+
+        // A spawn of this name may still be launching (parallel tool batch):
+        // wait until it registers instead of reporting an unknown name.
+        for (let waited = 0; reservedNames.has(requestedName) && waited < 15_000; waited += 100) {
+          await new Promise((r) => setTimeout(r, 100));
         }
 
         // ── Steer a running subagent ──
