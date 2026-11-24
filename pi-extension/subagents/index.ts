@@ -1929,6 +1929,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+            // Parent shutdown/reload: this session's pi handle is stale and the
+            // child may live on (persistent panes). Report nothing.
+            if (result.error === "cancelled") return;
 
             const presentation = resolveResultPresentation(result, running.name);
 
@@ -2367,6 +2370,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+            if (result.error === "cancelled") return; // parent shutdown/reload — see spawn path
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
